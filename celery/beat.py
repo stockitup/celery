@@ -274,7 +274,7 @@ class Scheduler:
             else:
                 q = get_queue()
 
-            entry.kwargs['meta'] = {'periodic_task':entry.id}
+            entry.kwargs['meta'] = {'periodic_task':entry.model.id}
             q.enqueue(entry.task, *entry.args, **entry.kwargs)
             #result = self.apply_async(entry, producer=producer, advance=False)
         except Exception as exc:  # pylint: disable=broad-except
