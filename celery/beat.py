@@ -268,9 +268,8 @@ class Scheduler:
         try:
             logger.warning(('celerybeat:', entry))
             from django_rq import get_queue
-            queue_name = entry.kwargs.pop('queue', None)
-            if queue_name:
-                q = get_queue(queue_name)
+            if entry.model.queue:
+                q = get_queue(entry.model.queue)
             else:
                 q = get_queue()
 
