@@ -266,7 +266,6 @@ class Scheduler:
     def apply_entry(self, entry, producer=None):
         info('Scheduler: Sending due task %s (%s)', entry.name, entry.task)
         try:
-            logger.warning(('celerybeat:', entry))
             from django_rq import get_queue
             if entry.model.queue:
                 q = get_queue(entry.model.queue)
