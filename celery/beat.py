@@ -267,7 +267,15 @@ class Scheduler:
         info('Scheduler: Sending due task %s (%s)', entry.name, entry.task)
         try:
             logger.warning(('celerybeat:', entry))
-            result = self.apply_async(entry, producer=producer, advance=False)
+            from django_rq import get_queue
+            if entry.queue:
+                q = get_queue(entry.queue)
+            else:
+                q = get_queue()
+
+            entry.kwargs['meta'] = {'periodic_task':entry.id}
+            q.enqueue(entry.task, *entry.args, **entry.kwargs)
+            #result = self.apply_async(entry, producer=producer, advance=False)
         except Exception as exc:  # pylint: disable=broad-except
             error('Message Error: %s\n%s',
                   exc, traceback.format_stack(), exc_info=True)
