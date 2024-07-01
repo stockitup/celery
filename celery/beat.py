@@ -265,6 +265,7 @@ class Scheduler:
 
     def apply_entry(self, entry, producer=None):
         info('Scheduler: Sending due task %s (%s)', entry.name, entry.task)
+        
         try:
             from django_rq import get_queue
             if entry.model.queue:
@@ -272,9 +273,13 @@ class Scheduler:
             else:
                 q = get_queue()
 
-            entry.kwargs['meta'] = {'periodic_task':entry.model.id}
-            q.enqueue(entry.task, *entry.args, **entry.kwargs)
-            #result = self.apply_async(entry, producer=producer, advance=False)
+            redis_connection = q.connection
+
+            if redis_connection.get('siu:system:celery_beat_enqueues_to_rq'):
+                entry.kwargs['meta'] = {'periodic_task':entry.model.id}
+                q.enqueue(entry.task, *entry.args, **entry.kwargs)
+            else:
+                result = self.apply_async(entry, producer=producer, advance=False)
         except Exception as exc:  # pylint: disable=broad-except
             error('Message Error: %s\n%s',
                   exc, traceback.format_stack(), exc_info=True)
