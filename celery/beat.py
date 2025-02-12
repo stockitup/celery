@@ -256,11 +256,7 @@ class Scheduler:
         entries = {}
         if self.app.conf.result_expires and \
                 not self.app.backend.supports_autoexpire:
-            if 'celery.backend_cleanup' not in data:
-                entries['celery.backend_cleanup'] = {
-                    'task': 'celery.backend_cleanup',
-                    'schedule': crontab('0', '4', '*'),
-                    'options': {'expires': 12 * 3600}}
+
         self.update_from_dict(entries)
 
     def apply_entry(self, entry, producer=None):
