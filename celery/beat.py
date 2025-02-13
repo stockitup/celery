@@ -254,9 +254,6 @@ class Scheduler:
 
     def install_default_entries(self, data):
         entries = {}
-        if self.app.conf.result_expires and \
-                not self.app.backend.supports_autoexpire:
-
         self.update_from_dict(entries)
 
     def apply_entry(self, entry, producer=None):
