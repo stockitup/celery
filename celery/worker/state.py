@@ -32,11 +32,18 @@ SOFTWARE_INFO = {
 }
 
 #: maximum number of revokes to keep in memory.
-REVOKES_MAX = 50000
+REVOKES_MAX = int(os.environ.get('CELERY_WORKER_REVOKES_MAX', 50000))
+
+#: maximum number of successful tasks to keep in memory.
+SUCCESSFUL_MAX = int(os.environ.get('CELERY_WORKER_SUCCESSFUL_MAX', 1000))
 
 #: how many seconds a revoke will be active before
 #: being expired when the max limit has been exceeded.
-REVOKE_EXPIRES = 10800
+REVOKE_EXPIRES = float(os.environ.get('CELERY_WORKER_REVOKE_EXPIRES', 10800))
+
+#: how many seconds a successful task will be cached in memory
+#: before being expired when the max limit has been exceeded.
+SUCCESSFUL_EXPIRES = float(os.environ.get('CELERY_WORKER_SUCCESSFUL_EXPIRES', 10800))
 
 #: Mapping of reserved task_id->Request.
 requests = {}
@@ -47,6 +54,10 @@ reserved_requests = weakref.WeakSet()
 #: set of currently active :class:`~celery.worker.request.Request`'s.
 active_requests = weakref.WeakSet()
 
+#: A limited set of successful :class:`~celery.worker.request.Request`'s.
+successful_requests = LimitedSet(maxlen=SUCCESSFUL_MAX,
+                                 expires=SUCCESSFUL_EXPIRES)
+
 #: count of tasks accepted by the worker, sorted by type.
 total_count = Counter()
 
@@ -56,6 +67,9 @@ all_total_count = [0]
 #: the list of currently revoked tasks.  Persistent if ``statedb`` set.
 revoked = LimitedSet(maxlen=REVOKES_MAX, expires=REVOKE_EXPIRES)
 
+#: Mapping of stamped headers flagged for revoking.
+revoked_stamps = {}
+
 should_stop = None
 should_terminate = None
 
@@ -64,9 +78,11 @@ def reset_state():
     requests.clear()
     reserved_requests.clear()
     active_requests.clear()
+    successful_requests.clear()
     total_count.clear()
     all_total_count[:] = [0]
     revoked.clear()
+    revoked_stamps.clear()
 
 
 def maybe_shutdown():
@@ -87,21 +103,27 @@ def task_reserved(request,
 
 def task_accepted(request,
                   _all_total_count=None,
+                  add_request=requests.__setitem__,
                   add_active_request=active_requests.add,
                   add_to_total_count=total_count.update):
     """Update global state when a task has been accepted."""
     if not _all_total_count:
         _all_total_count = all_total_count
+    add_request(request.id, request)
     add_active_request(request)
     add_to_total_count({request.name: 1})
     all_total_count[0] += 1
 
 
 def task_ready(request,
+               successful=False,
                remove_request=requests.pop,
                discard_active_request=active_requests.discard,
                discard_reserved_request=reserved_requests.discard):
     """Update global state when a task is ready."""
+    if successful:
+        successful_requests.add(request.id)
+
     remove_request(request.id, None)
     discard_active_request(request)
     discard_reserved_request(request)
@@ -137,7 +159,7 @@ if C_BENCH:  # pragma: no cover
                     sum(bench_sample) / len(bench_sample)))
                 memdump()
 
-    def task_reserved(request):  # noqa
+    def task_reserved(request):
         """Called when a task is reserved by the worker."""
         global bench_start
         global bench_first
@@ -149,7 +171,7 @@ if C_BENCH:  # pragma: no cover
 
         return __reserved(request)
 
-    def task_ready(request):  # noqa
+    def task_ready(request):
         """Called when a task is completed."""
         global all_count
         global bench_start

@@ -11,7 +11,7 @@ from celery.exceptions import ImproperlyConfigured
 try:
     import pycouchdb
 except ImportError:
-    pycouchdb = None  # noqa
+    pycouchdb = None
 
 COUCHDB_CONTAINER = 'celery_container'
 
@@ -20,7 +20,7 @@ pytest.importorskip('pycouchdb')
 
 class test_CouchBackend:
 
-    def setup(self):
+    def setup_method(self):
         self.Server = self.patching('pycouchdb.Server')
         self.backend = CouchBackend(app=self.app)
 

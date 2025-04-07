@@ -15,8 +15,7 @@ from celery.utils.collections import ConfigurationView
 from celery.utils.imports import import_from_cwd, qualname, symbol_by_name
 from celery.utils.text import pretty
 
-from .defaults import (_OLD_DEFAULTS, _OLD_SETTING_KEYS, _TO_NEW_KEY,
-                       _TO_OLD_KEY, DEFAULTS, SETTING_KEYS, find)
+from .defaults import _OLD_DEFAULTS, _OLD_SETTING_KEYS, _TO_NEW_KEY, _TO_OLD_KEY, DEFAULTS, SETTING_KEYS, find
 
 __all__ = (
     'Settings', 'appstr', 'bugreport',
@@ -129,7 +128,7 @@ class Settings(ConfigurationView):
     @property
     def timezone(self):
         # this way we also support django's time zone.
-        return self.first('timezone', 'time_zone')
+        return self.first('timezone', 'TIME_ZONE')
 
     def without_defaults(self):
         """Return the current configuration, but without defaults."""
@@ -394,7 +393,8 @@ def find_app(app, symbol_by_name=symbol_by_name, imp=import_from_cwd):
             try:
                 found = sym.celery
                 if isinstance(found, ModuleType):
-                    raise AttributeError("attribute 'celery' is the celery module not the instance of celery")
+                    raise AttributeError(
+                        "attribute 'celery' is the celery module not the instance of celery")
             except AttributeError:
                 if getattr(sym, '__path__', None):
                     try:

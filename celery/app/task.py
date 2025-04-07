@@ -1,16 +1,15 @@
 """Task implementation: request context and the task base class."""
 import sys
 
-from billiard.einfo import ExceptionInfo
+from billiard.einfo import ExceptionInfo, ExceptionWithTraceback
 from kombu import serialization
 from kombu.exceptions import OperationalError
 from kombu.utils.uuid import uuid
 
-from celery import current_app, group, states
+from celery import current_app, states
 from celery._state import _task_stack
-from celery.canvas import _chain, signature
-from celery.exceptions import (Ignore, ImproperlyConfigured,
-                               MaxRetriesExceededError, Reject, Retry)
+from celery.canvas import _chain, group, signature
+from celery.exceptions import Ignore, ImproperlyConfigured, MaxRetriesExceededError, Reject, Retry
 from celery.local import class_property
 from celery.result import EagerResult, denied_join_result
 from celery.utils import abstract
@@ -61,38 +60,56 @@ def _reprtask(task, fmt=None, flags=None):
 class Context:
     """Task request variables (Task.request)."""
 
-    logfile = None
-    loglevel = None
-    hostname = None
-    id = None
-    args = None
-    kwargs = None
-    retries = 0
-    eta = None
-    expires = None
-    is_eager = False
-    headers = None
-    delivery_info = None
-    reply_to = None
-    root_id = None
-    parent_id = None
-    correlation_id = None
-    taskset = None   # compat alias to group
-    group = None
-    group_index = None
-    chord = None
-    chain = None
-    utc = None
-    called_directly = True
-    callbacks = None
-    errbacks = None
-    timelimit = None
-    origin = None
     _children = None   # see property
     _protected = 0
+    args = None
+    callbacks = None
+    called_directly = True
+    chain = None
+    chord = None
+    correlation_id = None
+    delivery_info = None
+    errbacks = None
+    eta = None
+    expires = None
+    group = None
+    group_index = None
+    headers = None
+    hostname = None
+    id = None
+    ignore_result = False
+    is_eager = False
+    kwargs = None
+    logfile = None
+    loglevel = None
+    origin = None
+    parent_id = None
+    properties = None
+    retries = 0
+    reply_to = None
+    replaced_task_nesting = 0
+    root_id = None
+    shadow = None
+    taskset = None   # compat alias to group
+    timelimit = None
+    utc = None
+    stamped_headers = None
+    stamps = None
 
     def __init__(self, *args, **kwargs):
         self.update(*args, **kwargs)
+        if self.headers is None:
+            self.headers = self._get_custom_headers(*args, **kwargs)
+
+    def _get_custom_headers(self, *args, **kwargs):
+        headers = {}
+        headers.update(*args, **kwargs)
+        celery_keys = {*Context.__dict__.keys(), 'lang', 'task', 'argsrepr', 'kwargsrepr', 'compression'}
+        for key in celery_keys:
+            headers.pop(key, None)
+        if not headers:
+            return None
+        return headers
 
     def update(self, *args, **kwargs):
         return self.__dict__.update(*args, **kwargs)
@@ -104,16 +121,17 @@ class Context:
         return getattr(self, key, default)
 
     def __repr__(self):
-        return '<Context: {!r}>'.format(vars(self))
+        return f'<Context: {vars(self)!r}>'
 
     def as_execution_options(self):
         limit_hard, limit_soft = self.timelimit or (None, None)
-        return {
+        execution_options = {
             'task_id': self.id,
             'root_id': self.root_id,
             'parent_id': self.parent_id,
             'group_id': self.group,
             'group_index': self.group_index,
+            'shadow': self.shadow,
             'chord': self.chord,
             'chain': self.chain,
             'link': self.callbacks,
@@ -124,8 +142,15 @@ class Context:
             'headers': self.headers,
             'retries': self.retries,
             'reply_to': self.reply_to,
+            'replaced_task_nesting': self.replaced_task_nesting,
             'origin': self.origin,
         }
+        if hasattr(self, 'stamps') and hasattr(self, 'stamped_headers'):
+            if self.stamps is not None and self.stamped_headers is not None:
+                execution_options['stamped_headers'] = self.stamped_headers
+                for k, v in self.stamps.items():
+                    execution_options[k] = v
+        return execution_options
 
     @property
     def children(self):
@@ -219,9 +244,6 @@ class Task:
     #: The result store backend used for this task.
     backend = None
 
-    #: If disabled this task won't be registered automatically.
-    autoregister = True
-
     #: If enabled the task will report its status as 'started' when the task
     #: is executed by a worker.  Disabled by default as the normal behavior
     #: is to not report that level of granularity.  Tasks are either pending,
@@ -236,7 +258,7 @@ class Task:
     track_started = None
 
     #: When enabled messages for this task will be acknowledged **after**
-    #: the task has been executed, and not *just before* (the
+    #: the task has been executed, and not *right before* (the
     #: default behavior).
     #:
     #: Please note that this means the task may be executed twice if the
@@ -309,6 +331,7 @@ class Task:
         ('acks_on_failure_or_timeout', 'task_acks_on_failure_or_timeout'),
         ('reject_on_worker_lost', 'task_reject_on_worker_lost'),
         ('ignore_result', 'task_ignore_result'),
+        ('store_eager_result', 'task_store_eager_result'),
         ('store_errors_even_if_ignored', 'task_store_errors_even_if_ignored'),
     )
 
@@ -443,7 +466,7 @@ class Task:
             shadow (str): Override task name used in logs/monitoring.
                 Default is retrieved from :meth:`shadow_name`.
 
-            connection (kombu.Connection): Re-use existing broker connection
+            connection (kombu.Connection): Reuse existing broker connection
                 instead of acquiring one from the connection pool.
 
             retry (bool): If enabled sending of the task message will be
@@ -454,6 +477,11 @@ class Task:
 
             retry_policy (Mapping): Override the retry policy used.
                 See the :setting:`task_publish_retry_policy` setting.
+
+            time_limit (int): If set, overrides the default time limit.
+
+            soft_time_limit (int): If set, overrides the default soft
+                time limit.
 
             queue (str, kombu.Queue): The queue to route the task to.
                 This must be a key present in :setting:`task_queues`, or
@@ -499,9 +527,16 @@ class Task:
                 attribute.  Trailing can also be disabled by default using the
                 :attr:`trail` attribute
 
+            ignore_result (bool): If set to `False` (default) the result
+                of a task will be stored in the backend. If set to `True`
+                the result will not be stored. This can also be set
+                using the :attr:`ignore_result` in the `app.task` decorator.
+
             publisher (kombu.Producer): Deprecated alias to ``producer``.
 
             headers (Dict): Message headers to be included in the message.
+                The headers can be used as an overlay for custom labeling
+                using the :ref:`canvas-stamping` feature.
 
         Returns:
             celery.result.AsyncResult: Promise of future evaluation.
@@ -510,6 +545,8 @@ class Task:
             TypeError: If not enough arguments are passed, or too many
                 arguments are passed.  Note that signature checks may
                 be disabled by specifying ``@task(typing=False)``.
+            ValueError: If soft_time_limit and time_limit both are set
+                but soft_time_limit is greater than time_limit
             kombu.exceptions.OperationalError: If a connection to the
                transport cannot be made, or if the connection is lost.
 
@@ -517,6 +554,9 @@ class Task:
             Also supports all keyword arguments supported by
             :meth:`kombu.Producer.publish`.
         """
+        if self.soft_time_limit and self.time_limit and self.soft_time_limit > self.time_limit:
+            raise ValueError('soft_time_limit must be less than or equal to time_limit')
+
         if self.typing:
             try:
                 check_arguments = self.__header__
@@ -591,7 +631,7 @@ class Task:
         request = self.request if request is None else request
         args = request.args if args is None else args
         kwargs = request.kwargs if kwargs is None else kwargs
-        options = request.as_execution_options()
+        options = {**request.as_execution_options(), **extra_options}
         delivery_info = request.delivery_info or {}
         priority = delivery_info.get('priority')
         if priority is not None:
@@ -626,7 +666,7 @@ class Task:
             ...         twitter.post_status_update(message)
             ...     except twitter.FailWhale as exc:
             ...         # Retry in 5 minutes.
-            ...         self.retry(countdown=60 * 5, exc=exc)
+            ...         raise self.retry(countdown=60 * 5, exc=exc)
 
         Note:
             Although the task will never return above as `retry` raises an
@@ -755,6 +795,7 @@ class Task:
 
         request = {
             'id': task_id,
+            'task': self.name,
             'retries': retries,
             'is_eager': True,
             'logfile': logfile,
@@ -763,8 +804,20 @@ class Task:
             'callbacks': maybe_list(link),
             'errbacks': maybe_list(link_error),
             'headers': headers,
-            'delivery_info': {'is_eager': True},
+            'ignore_result': options.get('ignore_result', False),
+            'delivery_info': {
+                'is_eager': True,
+                'exchange': options.get('exchange'),
+                'routing_key': options.get('routing_key'),
+                'priority': options.get('priority'),
+            }
         }
+        if 'stamped_headers' in options:
+            request['stamped_headers'] = maybe_list(options['stamped_headers'])
+            request['stamps'] = {
+                header: maybe_list(options.get(header, [])) for header in request['stamped_headers']
+            }
+
         tb = None
         tracer = build_tracer(
             task.name, task, eager=True,
@@ -774,10 +827,12 @@ class Task:
         retval = ret.retval
         if isinstance(retval, ExceptionInfo):
             retval, tb = retval.exception, retval.traceback
+            if isinstance(retval, ExceptionWithTraceback):
+                retval = retval.exc
         if isinstance(retval, Retry) and retval.sig is not None:
             return retval.sig.apply(retries=retries + 1)
         state = states.SUCCESS if ret.info is None else ret.info.state
-        return EagerResult(task_id, retval, state, traceback=tb)
+        return EagerResult(task_id, retval, state, traceback=tb, name=self.name)
 
     def AsyncResult(self, task_id, **kwargs):
         """Get AsyncResult instance for the specified task.
@@ -864,7 +919,8 @@ class Task:
         .. versionadded:: 4.0
 
         Arguments:
-            sig (~@Signature): signature to replace with.
+            sig (Signature): signature to replace with.
+            visitor (StampingVisitor): Visitor API object.
 
         Raises:
             ~@Ignore: This is always raised when called in asynchronous context.
@@ -876,46 +932,51 @@ class Task:
             raise ImproperlyConfigured(
                 "A signature replacing a task must not be part of a chord"
             )
+        if isinstance(sig, _chain) and not getattr(sig, "tasks", True):
+            raise ImproperlyConfigured("Cannot replace with an empty chain")
 
+        # Ensure callbacks or errbacks from the replaced signature are retained
         if isinstance(sig, group):
-            sig |= self.app.tasks['celery.accumulate'].s(index=0).set(
-                link=self.request.callbacks,
-                link_error=self.request.errbacks,
-            )
-        elif isinstance(sig, _chain):
-            if not sig.tasks:
-                raise ImproperlyConfigured(
-                    "Cannot replace with an empty chain"
-                )
-
-        if self.request.chain:
-            # We need to freeze the new signature with the current task's ID to
-            # ensure that we don't disassociate the new chain from the existing
-            # task IDs which would break previously constructed results
-            # objects.
-            sig.freeze(self.request.id)
-            if "link" in sig.options:
-                final_task_links = sig.tasks[-1].options.setdefault("link", [])
-                final_task_links.extend(maybe_list(sig.options["link"]))
-            # Construct the new remainder of the task by chaining the signature
-            # we're being replaced by with signatures constructed from the
-            # chain elements in the current request.
-            for t in reversed(self.request.chain):
-                sig |= signature(t, app=self.app)
-
+            # Groups get uplifted to a chord so that we can link onto the body
+            sig |= self.app.tasks['celery.accumulate'].s(index=0)
+        for callback in maybe_list(self.request.callbacks) or []:
+            sig.link(callback)
+        for errback in maybe_list(self.request.errbacks) or []:
+            sig.link_error(errback)
+        # If the replacement signature is a chain, we need to push callbacks
+        # down to the final task so they run at the right time even if we
+        # proceed to link further tasks from the original request below
+        if isinstance(sig, _chain) and "link" in sig.options:
+            final_task_links = sig.tasks[-1].options.setdefault("link", [])
+            final_task_links.extend(maybe_list(sig.options["link"]))
+        # We need to freeze the replacement signature with the current task's
+        # ID to ensure that we don't disassociate it from the existing task IDs
+        # which would break previously constructed results objects.
+        sig.freeze(self.request.id)
+        # Ensure the important options from the original signature are retained
+        replaced_task_nesting = self.request.get('replaced_task_nesting', 0) + 1
         sig.set(
             chord=chord,
             group_id=self.request.group,
             group_index=self.request.group_index,
             root_id=self.request.root_id,
+            replaced_task_nesting=replaced_task_nesting
         )
-        sig.freeze(self.request.id)
 
-        if self.request.is_eager:
-            return sig.apply().get()
-        else:
-            sig.delay()
-            raise Ignore('Replaced by new task')
+        # If the replaced task is a chain, we want to set all of the chain tasks
+        # with the same replaced_task_nesting value to mark their replacement nesting level
+        if isinstance(sig, _chain):
+            for chain_task in maybe_list(sig.tasks) or []:
+                chain_task.set(replaced_task_nesting=replaced_task_nesting)
+
+        # If the task being replaced is part of a chain, we need to re-create
+        # it with the replacement signature - these subsequent tasks will
+        # retain their original task IDs as well
+        for t in reversed(self.request.chain or []):
+            chain_task = signature(t, app=self.app)
+            chain_task.set(replaced_task_nesting=replaced_task_nesting)
+            sig |= chain_task
+        return self.on_replace(sig)
 
     def add_to_chord(self, sig, lazy=False):
         """Add signature to the chord the current task is a member of.
@@ -925,7 +986,7 @@ class Task:
         Currently only supported by the Redis result backend.
 
         Arguments:
-            sig (~@Signature): Signature to extend chord with.
+            sig (Signature): Signature to extend chord with.
             lazy (bool): If enabled the new task won't actually be called,
                 and ``sig.delay()`` must be called manually.
         """
@@ -952,7 +1013,22 @@ class Task:
         """
         if task_id is None:
             task_id = self.request.id
-        self.backend.store_result(task_id, meta, state, request=self.request, **kwargs)
+        self.backend.store_result(
+            task_id, meta, state, request=self.request, **kwargs)
+
+    def before_start(self, task_id, args, kwargs):
+        """Handler called before the task starts.
+
+        .. versionadded:: 5.2
+
+        Arguments:
+            task_id (str): Unique id of the task to execute.
+            args (Tuple): Original arguments for the task to execute.
+            kwargs (Dict): Original keyword arguments for the task to execute.
+
+        Returns:
+            None: The return value of this handler is ignored.
+        """
 
     def on_success(self, retval, task_id, args, kwargs):
         """Success handler.
@@ -1016,13 +1092,31 @@ class Task:
             None: The return value of this handler is ignored.
         """
 
+    def on_replace(self, sig):
+        """Handler called when the task is replaced.
+
+        Must return super().on_replace(sig) when overriding to ensure the task replacement
+        is properly handled.
+
+        .. versionadded:: 5.3
+
+        Arguments:
+            sig (Signature): signature to replace with.
+        """
+        # Finally, either apply or delay the new signature!
+        if self.request.is_eager:
+            return sig.apply().get()
+        else:
+            sig.delay()
+            raise Ignore('Replaced by new task')
+
     def add_trail(self, result):
         if self.trail:
             self.request.children.append(result)
         return result
 
     def push_request(self, *args, **kwargs):
-        self.request_stack.push(Context(*args, **kwargs))
+        self.request_stack.push(Context(*args, **{**self.request.__dict__, **kwargs}))
 
     def pop_request(self):
         self.request_stack.pop()
@@ -1049,14 +1143,14 @@ class Task:
         return self._exec_options
 
     @property
-    def backend(self):
+    def backend(self):  # noqa: F811
         backend = self._backend
         if backend is None:
             return self.app.backend
         return backend
 
     @backend.setter
-    def backend(self, value):  # noqa
+    def backend(self, value):
         self._backend = value
 
     @property
@@ -1064,4 +1158,4 @@ class Task:
         return self.__class__.__name__
 
 
-BaseTask = Task  # noqa: E305 XXX compat alias
+BaseTask = Task  # XXX compat alias

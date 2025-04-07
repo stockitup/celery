@@ -4,6 +4,7 @@ import logging
 from kombu.asynchronous.timer import to_timestamp
 
 from celery import signals
+from celery.app import trace as _app_trace
 from celery.exceptions import InvalidTaskError
 from celery.utils.imports import symbol_by_name
 from celery.utils.log import get_logger
@@ -124,7 +125,7 @@ def default(task, app, consumer,
     limit_task = consumer._limit_task
     limit_post_eta = consumer._limit_post_eta
     Request = symbol_by_name(task.Request)
-    Req = create_request_cls(Request, task, consumer.pool, hostname, eventer)
+    Req = create_request_cls(Request, task, consumer.pool, hostname, eventer, app=app)
 
     revoked_tasks = consumer.controller.state.revoked
 
@@ -148,7 +149,16 @@ def default(task, app, consumer,
             body=body, headers=headers, decoded=decoded, utc=utc,
         )
         if _does_info:
-            info('Received task: %s', req)
+            # Similar to `app.trace.info()`, we pass the formatting args as the
+            # `extra` kwarg for custom log handlers
+            context = {
+                'id': req.id,
+                'name': req.name,
+                'args': req.argsrepr,
+                'kwargs': req.kwargsrepr,
+                'eta': req.eta,
+            }
+            info(_app_trace.LOG_RECEIVED, context, extra={'data': context})
         if (req.expires or req.id in revoked_tasks) and req.revoked():
             return
 
